@@ -214,10 +214,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# Streamlit
+.streamlit/secrets.toml
+
 .env
 models/generator/
 models/checkpoints/
 data/
 outputs/
-# Streamlit
-.streamlit/secrets.toml
