@@ -1,0 +1,8 @@
+torch==2.12.0
+torchvision==0.27.0
+stable-baselines3==2.8.0
+gymnasium==1.2.3
+numpy==2.4.4
+matplotlib==3.10.9
+pillow==12.2.0
+pandas==3.0.3
