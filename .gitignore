@@ -217,8 +217,3 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-.env
-models/generator/
-models/checkpoints/
-data/
-outputs/
