@@ -59,6 +59,11 @@ class Tentacle:
     MUSCLE_STIFFNESS  = 180.0  # active pull per unit stretch × contraction
     PASSIVE_STIFFNESS = 2.2    # passive spring beyond natural rest
 
+    # Push (extension against anchor) — a planted arm shoving the body away.
+    # Mirror of tension_force: the substrate reacts on the arm, driving the
+    # body in the anchor→root direction.  Scaled by push_cmd from the controller.
+    PUSH_STIFFNESS    = 230.0  # body-reaction force per unit push_cmd
+
     # Verlet physics
     DRAG             = 0.91    # per-point Verlet damping (slightly reduced for inertia)
     BASE_SEG_DRAG    = 10.0    # seabed drag coefficient at root
@@ -92,6 +97,19 @@ class Tentacle:
         self.reach_offset      = 0.0   # angular offset for tip target
         self.contract_strength = 0.0   # [0,1] target contraction level
 
+        # Extra control input — written by the locomotion controller (not RL).
+        # Defaults to 0 so the 24-value RL action space is unchanged: an arm
+        # only pushes when something explicitly raises push_cmd.
+        self.push_cmd          = 0.0   # [0,1] extend-and-shove against anchor
+
+        # How far a free arm reaches out, as a fraction of full length.  The
+        # controller lowers this near the target for short, fine strokes.
+        # Default 1.0 keeps RL (which never sets it) reaching at full length.
+        self.reach_scale       = 1.0   # [~0,1] multiplies reach distance
+
+        # High-level role tag, set by TentacleController, read by the renderer.
+        self.role              = "idle"
+
         self.world_angle: float = attach_angle
 
         # Grip state machine
@@ -107,6 +125,7 @@ class Tentacle:
         # Diagnostic fields (updated each frame, read by renderer)
         self._anchor_disp      = 0.0   # tip-to-grip_point distance after solver
         self._last_tension_mag = 0.0   # cached body-pull magnitude
+        self._last_push_mag    = 0.0   # cached body-push magnitude
 
     # ------------------------------------------------------------------
     # Frame entry points called by Octopus
@@ -220,7 +239,8 @@ class Tentacle:
             tip  = self.points[-1]
             root = self.points[0]
             target_angle = self.world_angle + self.reach_offset
-            reach_dist   = self.SEG_LEN * self.n * 0.9
+            reach_scale  = float(np.clip(self.reach_scale, 0.2, 1.0))
+            reach_dist   = self.SEG_LEN * self.n * 0.9 * reach_scale
             target = root.pos + np.array([
                 math.cos(target_angle) * reach_dist,
                 math.sin(target_angle) * reach_dist,
@@ -346,6 +366,47 @@ class Tentacle:
         total = (passive + active) * slip_factor
         self._last_tension_mag = total
         return direction * total
+
+    def push_force(self) -> np.ndarray:
+        """
+        Reaction force a planted arm exerts on the body when it shoves itself
+        away from its anchor (push_cmd > 0).
+
+        Physical picture: the tip is gripped on the seabed and the arm extends,
+        pressing against the substrate.  By Newton's third law the substrate
+        pushes back along anchor→root, driving the body away from the grip
+        point.  This is the mirror of tension_force(): pulling arms drag the
+        body toward their anchor, pushing arms drive it away.
+
+        Returns the body-side push vector (zero unless anchored and commanded).
+        A pushing arm runs with low contraction, so its tension_force() is
+        near zero — the two never fight for the same arm.
+        """
+        if self.state not in (GripState.PLANTED, GripState.SLIPPING):
+            self._last_push_mag = 0.0
+            return np.zeros(2)
+        if self.push_cmd < 0.05:
+            self._last_push_mag = 0.0
+            return np.zeros(2)
+
+        root   = self.points[0].pos
+        anchor = self.grip_point
+        vec    = root - anchor            # anchor → root: pushes body away
+        dist   = float(np.linalg.norm(vec))
+        if dist < 1e-6:
+            self._last_push_mag = 0.0
+            return np.zeros(2)
+
+        direction = vec / dist
+
+        # Slipping grip transmits less push, same as pull traction.
+        slip_factor = 1.0
+        if self.state == GripState.SLIPPING:
+            slip_factor = max(0.05, 1.0 - self.slip_amount / self.MAX_SLIP_DIST)
+
+        mag = self.push_cmd * self.PUSH_STIFFNESS * slip_factor
+        self._last_push_mag = mag
+        return direction * mag
 
     # ------------------------------------------------------------------
     # Per-segment tension for visualization

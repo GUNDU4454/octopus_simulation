@@ -17,6 +17,7 @@ import pygame
 import numpy as np
 import math
 from src.entities.tentacle import GripState
+from src.locomotion.tentacle_controller import Role
 
 # ── Colour palette ────────────────────────────────────────────────────
 BG_SAND       = ( 38,  48,  28)
@@ -51,6 +52,27 @@ CONTRACT_BAR_FULL = (220,  60,  30)
 CONTRACT_BAR_LOW  = ( 40, 110, 180)
 TENSION_BAR       = (220, 160,  40)
 
+PUSH_ARM      = ( 70, 200, 235)   # per-arm push (extension) arrow — cyan
+TARGET_COL    = (255, 235,  90)   # crawl target marker / direction line
+COM_COL       = (255, 120, 200)   # centre-of-mass crosshair
+FORWARD_COL   = (120, 200, 255)   # body-forward (current heading) arrow
+TORQUE_COL    = (255, 140, 220)   # net rotation-torque turn indicator
+
+# Role → colour.  Roles describe what each arm is *doing* this frame and drive
+# the arm tint + the debug panel, so the behaviour is readable at a glance.
+ROLE_COLORS = {
+    Role.PULLING:     (235,  90,  60),   # red-orange — dragging body to target
+    Role.PUSHING:     ( 70, 200, 235),   # cyan       — shoving body forward
+    Role.ANCHORING:   ( 80, 200, 120),   # green      — stable holding grip
+    Role.STABILIZING: (185, 115, 225),   # purple     — damping rotation
+    Role.SEARCHING:   (205, 195,  95),   # yellow     — reaching for a grip
+    Role.IDLE:        ( 90, 120, 150),   # dim blue   — relaxed
+}
+
+
+def role_color(role: str) -> tuple:
+    return ROLE_COLORS.get(role, ARM_FREE)
+
 
 class Renderer:
 
@@ -73,16 +95,31 @@ class Renderer:
     # Public
     # ------------------------------------------------------------------
 
-    def draw(self, octopus, step: int):
+    def draw(self, octopus, step: int, manager=None, debug: bool = True):
         self.screen.blit(self._bg, (0, 0))
         self._draw_grid()
-        self._draw_tentacles(octopus)
-        self._draw_grip_contacts(octopus)
-        self._draw_tension_vectors(octopus)
-        self._draw_body_net_force(octopus)
+
+        # Target + heading are useful even with the debug overlay off.
+        self._draw_target(octopus, manager)
+
+        self._draw_tentacles(octopus, debug)
+        if debug:
+            self._draw_grip_contacts(octopus)
+            self._draw_tension_vectors(octopus)
+            self._draw_push_vectors(octopus)
+            self._draw_body_net_force(octopus)
+            self._draw_body_orientation(octopus, manager)
+
         self._draw_body(octopus)
-        self._draw_contraction_bars(octopus)
-        self._draw_hud(octopus, step)
+
+        if debug:
+            self._draw_com(octopus)
+            self._draw_arm_labels(octopus)
+            self._draw_contraction_bars(octopus)
+            self._draw_hud(octopus, step)
+            self._draw_role_panel(octopus, manager)
+        else:
+            self._draw_minimal_hint()
 
     # ------------------------------------------------------------------
     # Seabed
@@ -110,15 +147,20 @@ class Renderer:
     # Tentacles with contraction heat-map
     # ------------------------------------------------------------------
 
-    def _draw_tentacles(self, octopus):
+    def _draw_tentacles(self, octopus, debug: bool = True):
         for arm in octopus.arms:
             positions = arm.get_positions()
             n = len(positions)
             if n < 2:
                 continue
 
-            # Base colour by state
-            if   arm.state == GripState.PLANTED:    base = ARM_PLANTED
+            # Base colour: by role when debugging and a role is active (shows
+            # behaviour); otherwise by raw grip state (cleaner look, and the
+            # fallback the RL training view uses since it sets no roles).
+            role = getattr(arm, "role", Role.IDLE)
+            if debug and role != Role.IDLE:
+                base = role_color(role)
+            elif arm.state == GripState.PLANTED:    base = ARM_PLANTED
             elif arm.state == GripState.SLIPPING:   base = ARM_SLIPPING
             elif arm.state == GripState.RETRACTING: base = ARM_RETRACT
             else:                                   base = ARM_FREE
@@ -235,6 +277,167 @@ class Renderer:
             self.screen.blit(lbl, (ex + 4, ey - 6))
 
     # ------------------------------------------------------------------
+    # Push vectors — per pushing arm (body-reaction force away from anchor)
+    # ------------------------------------------------------------------
+
+    def _draw_push_vectors(self, octopus):
+        for arm in octopus.arms:
+            fmag = getattr(arm, "_last_push_mag", 0.0)
+            if fmag < 1.0:
+                continue
+            f = arm.push_force()
+            fmag = float(np.linalg.norm(f))
+            if fmag < 1.0:
+                continue
+            root = arm.root_pos()
+            rx, ry = int(root[0]), int(root[1])
+            scale = self.ARM_FORCE_SCALE * min(fmag, 600.0) / max(fmag, 1.0)
+            ex = int(rx + f[0] * scale)
+            ey = int(ry + f[1] * scale)
+            pygame.draw.line(self.screen, PUSH_ARM, (rx, ry), (ex, ey), 2)
+            self._arrow_head(rx, ry, ex, ey, PUSH_ARM, size=7)
+            lbl = self.font_xs.render(f"{fmag:.0f}", True, PUSH_ARM)
+            self.screen.blit(lbl, (ex + 4, ey - 6))
+
+    # ------------------------------------------------------------------
+    # Crawl target + move-direction indicator
+    # ------------------------------------------------------------------
+
+    def _draw_target(self, octopus, manager):
+        if manager is None:
+            return
+        target = manager.target
+        if target is None:
+            return
+        tx, ty = int(target[0]), int(target[1])
+        bx, by = int(octopus.pos[0]), int(octopus.pos[1])
+
+        # Dotted line body → target.
+        self._dotted_line((bx, by), (tx, ty), TARGET_COL, gap=10)
+
+        # Pulsing target ring + crosshair.
+        pulse = 10 + int(4 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.006)))
+        pygame.draw.circle(self.screen, TARGET_COL, (tx, ty), pulse, 2)
+        pygame.draw.line(self.screen, TARGET_COL, (tx - 9, ty), (tx + 9, ty), 1)
+        pygame.draw.line(self.screen, TARGET_COL, (tx, ty - 9), (tx, ty + 9), 1)
+        lbl = self.font_xs.render("target", True, TARGET_COL)
+        self.screen.blit(lbl, (tx + 12, ty - 6))
+
+        # Short heading arrow on the body, pointing at the target.
+        d = target - octopus.pos
+        dist = float(np.linalg.norm(d))
+        if dist > 1.0:
+            d = d / dist
+            ax = int(bx + d[0] * (octopus.RADIUS + 22))
+            ay = int(by + d[1] * (octopus.RADIUS + 22))
+            pygame.draw.line(self.screen, TARGET_COL, (bx, by), (ax, ay), 2)
+            self._arrow_head(bx, by, ax, ay, TARGET_COL, size=8)
+
+    def _dotted_line(self, p1, p2, col, gap: int = 10):
+        x1, y1 = p1
+        x2, y2 = p2
+        dist = math.hypot(x2 - x1, y2 - y1)
+        if dist < 1:
+            return
+        steps = int(dist // gap)
+        for s in range(0, steps, 2):
+            t1 = s / max(steps, 1)
+            t2 = min(1.0, (s + 1) / max(steps, 1))
+            ax = int(x1 + (x2 - x1) * t1); ay = int(y1 + (y2 - y1) * t1)
+            bx = int(x1 + (x2 - x1) * t2); by = int(y1 + (y2 - y1) * t2)
+            pygame.draw.line(self.screen, col, (ax, ay), (bx, by), 1)
+
+    # ------------------------------------------------------------------
+    # Centre-of-mass indicator
+    # ------------------------------------------------------------------
+
+    def _draw_com(self, octopus):
+        cx, cy = int(octopus.pos[0]), int(octopus.pos[1])
+        pygame.draw.circle(self.screen, COM_COL, (cx, cy), 4, 1)
+        pygame.draw.line(self.screen, COM_COL, (cx - 7, cy), (cx + 7, cy), 1)
+        pygame.draw.line(self.screen, COM_COL, (cx, cy - 7), (cx, cy + 7), 1)
+        lbl = self.font_xs.render("COM", True, COM_COL)
+        self.screen.blit(lbl, (cx + 8, cy + 6))
+
+    # ------------------------------------------------------------------
+    # Per-arm number labels (above each arm's mid-point)
+    # ------------------------------------------------------------------
+
+    def _draw_arm_labels(self, octopus):
+        for i, arm in enumerate(octopus.arms):
+            pts = arm.get_positions()
+            mid = pts[len(pts) // 2]
+            col = role_color(getattr(arm, "role", Role.IDLE))
+            lbl = self.font_md.render(str(i), True, (15, 15, 15))
+            bg  = lbl.get_rect()
+            bg.center = (int(mid[0]), int(mid[1]))
+            pygame.draw.circle(self.screen, col, bg.center, 9)
+            pygame.draw.circle(self.screen, (15, 15, 15), bg.center, 9, 1)
+            self.screen.blit(lbl, (bg.center[0] - lbl.get_width() // 2,
+                                   bg.center[1] - lbl.get_height() // 2))
+
+    # ------------------------------------------------------------------
+    # Per-tentacle role panel (right side)
+    # ------------------------------------------------------------------
+
+    def _draw_role_panel(self, octopus, manager):
+        rows = manager.role_summary() if manager is not None else None
+        if rows is None:
+            return
+
+        line_h = 30
+        pad    = 8
+        w      = 218
+        h      = len(rows) * line_h + pad * 2 + 16
+        x0     = self.width - w - 10
+        y0     = 10
+
+        panel = pygame.Surface((w, h), pygame.SRCALPHA)
+        panel.fill((8, 14, 10, 200))
+        self.screen.blit(panel, (x0, y0))
+
+        title = self.font_md.render("TENTACLES", True, HUD_TEXT)
+        self.screen.blit(title, (x0 + pad, y0 + pad))
+
+        for r in rows:
+            ry  = y0 + pad + 16 + r["idx"] * line_h
+            col = role_color(r["role"])
+
+            # Number swatch.
+            pygame.draw.circle(self.screen, col, (x0 + pad + 7, ry + 8), 8)
+            num = self.font_sm.render(str(r["idx"]), True, (15, 15, 15))
+            self.screen.blit(num, (x0 + pad + 7 - num.get_width() // 2,
+                                   ry + 8 - num.get_height() // 2))
+
+            # Role + grip line.
+            grip = "grip" if r["gripping"] else "----"
+            head = self.font_sm.render(
+                f"{r['role']:<11} {grip}", True, col
+            )
+            self.screen.blit(head, (x0 + pad + 22, ry))
+
+            # Detail line: force (tension or push), extension.
+            force = r["push"] if r["role"] == Role.PUSHING else r["tension"]
+            ftag  = "push" if r["role"] == Role.PUSHING else "pull"
+            detail = self.font_xs.render(
+                f"{ftag} {force:>4.0f}N  ext {r['extension']*100:>3.0f}%"
+                f"  dir {r['reach_deg']:>+4.0f}°",
+                True, HUD_TEXT
+            )
+            self.screen.blit(detail, (x0 + pad + 22, ry + 14))
+
+    # ------------------------------------------------------------------
+    # Minimal hint when debug overlay is off
+    # ------------------------------------------------------------------
+
+    def _draw_minimal_hint(self):
+        hint = self.font_xs.render(
+            "[ D ] debug   [ click ] target   [ r ] reset   [ space ] pause",
+            True, (90, 105, 80)
+        )
+        self.screen.blit(hint, (12, self.height - 18))
+
+    # ------------------------------------------------------------------
     # Body net force accumulation arrow
     # ------------------------------------------------------------------
 
@@ -258,6 +461,52 @@ class Renderer:
         if abs(vx - bx) + abs(vy - by) > 3:
             pygame.draw.line(self.screen, VELOCITY_VEC, (bx, by), (vx, vy), 2)
             self._arrow_head(bx, by, vx, vy, VELOCITY_VEC, size=7)
+
+    # ------------------------------------------------------------------
+    # Body orientation: current forward vector + rotation-torque indicator
+    # ------------------------------------------------------------------
+
+    def _draw_body_orientation(self, octopus, manager):
+        cx, cy = octopus.pos[0], octopus.pos[1]
+        r      = octopus.RADIUS
+
+        # Body forward vector — where the body is currently facing.
+        fl = r + 46
+        fx = int(cx + math.cos(octopus.angle) * fl)
+        fy = int(cy + math.sin(octopus.angle) * fl)
+        pygame.draw.line(self.screen, FORWARD_COL, (int(cx), int(cy)), (fx, fy), 2)
+        self._arrow_head(int(cx), int(cy), fx, fy, FORWARD_COL, size=8)
+        self.screen.blit(self.font_xs.render("forward", True, FORWARD_COL),
+                         (fx + 5, fy - 6))
+
+        # Rotation-torque indicator — a curved arrow whose sweep direction shows
+        # which way the net tentacle torque is turning the body (same x=cos /
+        # y=sin convention as the physics, so it matches the real rotation).
+        tau = octopus.body_net_torque
+        if abs(tau) > 8.0:
+            arc_r     = r + 16
+            sweep     = min(2.2, 0.4 + abs(tau) / 500.0)
+            direction = 1.0 if tau > 0.0 else -1.0   # angle increases for +torque
+            start     = octopus.angle - direction * sweep   # lead end ends near forward
+            steps     = 16
+            pts = [
+                (int(cx + math.cos(start + direction * sweep * k / steps) * arc_r),
+                 int(cy + math.sin(start + direction * sweep * k / steps) * arc_r))
+                for k in range(steps + 1)
+            ]
+            pygame.draw.lines(self.screen, TORQUE_COL, False, pts, 3)
+            self._arrow_head(pts[-2][0], pts[-2][1], pts[-1][0], pts[-1][1],
+                             TORQUE_COL, size=8)
+            self.screen.blit(self.font_xs.render("turn", True, TORQUE_COL),
+                             (pts[-1][0] + 4, pts[-1][1] - 6))
+
+        # Heading-error readout (how far the body still has to rotate).
+        drive = getattr(manager, "drive", None) if manager is not None else None
+        if drive is not None and getattr(drive, "has_target", False):
+            txt = (f"heading err {math.degrees(drive.heading_error):>+4.0f}°"
+                   f"  turn {drive.turn_gain*100:>3.0f}%")
+            self.screen.blit(self.font_xs.render(txt, True, FORWARD_COL),
+                             (int(cx) - 70, int(cy) + r + 16))
 
     def _arrow_head(self, x1, y1, x2, y2, col, size=7):
         dx, dy = x2-x1, y2-y1
@@ -355,6 +604,7 @@ class Renderer:
             f"anchored {octopus.planted_count}/8",
             f"dist    {octopus.total_distance:>6.0f} px",
             f"net_F   {fmag:>6.0f} N",
+            f"net_T   {octopus.body_net_torque:>+6.0f}",
         ]
 
         pad = 10
@@ -375,11 +625,8 @@ class Renderer:
         for i, arm in enumerate(octopus.arms):
             x = 12 + i * 44
 
-            # State background
-            if   arm.state == GripState.PLANTED:    bg = ARM_PLANTED
-            elif arm.state == GripState.SLIPPING:   bg = ARM_SLIPPING
-            elif arm.state == GripState.RETRACTING: bg = ARM_RETRACT
-            else:                                   bg = ARM_FREE
+            # Role background
+            bg = role_color(getattr(arm, "role", Role.IDLE))
             pygame.draw.rect(self.screen, bg, (x, strip_y, 36, 14))
 
             # Contraction level bar overlay (filled bottom portion)
@@ -411,9 +658,9 @@ class Renderer:
             if bar_w > 0:
                 pygame.draw.rect(self.screen, TENSION_BAR, (x, bar_y, bar_w, 6))
 
-        # Legend
+        # Role legend
         legend = self.font_xs.render(
-            "reach  planted  slip  retract   [ contraction bar ]  [ tension ]",
+            "pull  push  anchor  stabilize  search   [ contraction ]  [ tension ]",
             True, (70, 80, 60)
         )
         self.screen.blit(legend, (12, self.height - 22))
@@ -421,13 +668,15 @@ class Renderer:
         # Force legend
         fleg_col  = self.font_xs.render("── net force", True, FORCE_BODY)
         vleg_col  = self.font_xs.render("── velocity", True, VELOCITY_VEC)
-        tleg_col  = self.font_xs.render("── arm tension", True, FORCE_ARM)
-        self.screen.blit(fleg_col,  (self.width - 250, self.height - 58))
-        self.screen.blit(vleg_col,  (self.width - 250, self.height - 44))
-        self.screen.blit(tleg_col,  (self.width - 250, self.height - 30))
+        tleg_col  = self.font_xs.render("── arm pull", True, FORCE_ARM)
+        pleg_col  = self.font_xs.render("── arm push", True, PUSH_ARM)
+        self.screen.blit(fleg_col,  (self.width - 250, self.height - 72))
+        self.screen.blit(vleg_col,  (self.width - 250, self.height - 58))
+        self.screen.blit(tleg_col,  (self.width - 250, self.height - 44))
+        self.screen.blit(pleg_col,  (self.width - 250, self.height - 30))
 
         ctrl = self.font_xs.render(
-            "[ esc/q ] quit    [ r ] reset    [ space ] pause",
+            "[ click ] target   [ d ] debug   [ r ] reset   [ space ] pause   [ esc/q ] quit",
             True, (50, 62, 42)
         )
-        self.screen.blit(ctrl, (self.width - 380, self.height - 14))
+        self.screen.blit(ctrl, (self.width - 560, self.height - 14))

@@ -31,30 +31,24 @@ RL interface
 import numpy as np
 import math
 from src.entities.tentacle import Tentacle, GripState
+from src.locomotion.body_physics import BodyPhysicsController
 
 
 class Octopus:
-    RADIUS         = 28
-
-    # Body mass — heavier body requires more coordinated pulling to move
-    MASS           = 9.0
-    INERTIA        = 1200.0
-
-    # Per-second drag coefficients (fps-independent, applied as exp(-k*dt))
-    DRAG_K         = 3.5    # linear drag (water resistance)
-    ANGULAR_DRAG_K = 2.8    # rotational drag
-
-    # Seabed friction: constant force opposing body sliding
-    # Reduced by active gripping (tentacles provide traction)
-    SEABED_FRICTION = 14.0
-
+    RADIUS = 28
     N_ARMS = 8
+
+    # Body rigid-motion constants now live in BodyPhysicsController (mass,
+    # inertia, drag, seabed friction).  Kept here as a delegated controller so
+    # arm logic and body integration can be tuned independently.
 
     def __init__(self, x: float, y: float):
         self.pos         = np.array([x, y], dtype=np.float64)
         self.vel         = np.zeros(2, dtype=np.float64)
         self.angle       = 0.0
         self.angular_vel = 0.0
+
+        self.body_physics = BodyPhysicsController()
 
         self.arms: list[Tentacle] = []
         for i in range(self.N_ARMS):
@@ -71,8 +65,15 @@ class Octopus:
 
         self.total_distance = 0.0
         self.time_alive     = 0.0
-        self.planted_count  = 0
-        self.body_net_force = np.zeros(2, dtype=np.float64)  # visualisation
+        self.planted_count   = 0
+        self.body_net_force  = np.zeros(2, dtype=np.float64)  # visualisation
+        self.body_net_torque = 0.0                            # visualisation
+
+        # Steering torque the locomotion controller asks the arms to generate by
+        # tensioning differentially against their grips (set each frame by the
+        # LocomotionManager; gated by traction below).  Defaults to 0 so the RL
+        # path, which never sets it, is unaffected.
+        self.steer_torque    = 0.0
 
     # ------------------------------------------------------------------
     # Main update — ALL motion comes from tentacle force transfer
@@ -85,52 +86,44 @@ class Octopus:
         for arm in self.arms:
             arm.update_root(self.pos[0], self.pos[1], self.angle, self.RADIUS)
 
-        # Accumulate locomotion forces from anchored, contracting arms
+        # Accumulate locomotion forces from anchored arms.
+        # Pulling arms drag the body toward their anchor (tension_force);
+        # pushing arms shove it away from their anchor (push_force).  An arm
+        # in either role counts as "planted" (gripping) for traction.
         total_force  = np.zeros(2)
         total_torque = 0.0
         planted = 0
 
         for arm in self.arms:
-            f = arm.tension_force()
-            fmag = float(np.linalg.norm(f))
-            if fmag > 0.0:
+            arm_force = arm.tension_force() + arm.push_force()
+            if arm.is_anchored:
                 planted += 1
-                total_force += f
+            fmag = float(np.linalg.norm(arm_force))
+            if fmag > 0.0:
+                total_force += arm_force
                 r = arm.root_pos() - self.pos
-                total_torque += r[0] * f[1] - r[1] * f[0]
+                total_torque += r[0] * arm_force[1] - r[1] * arm_force[0]
 
-        self.planted_count  = planted
-        self.body_net_force = total_force.copy()
+        # Add the controller's steering torque, but only to the extent the arms
+        # have purchase on the seabed — with nothing anchored there is nothing to
+        # torque against, so the body cannot turn in place.  grip_fraction is the
+        # raw planted ratio (used elsewhere for friction); steering needs only a
+        # few solid anchors to have leverage, so it saturates quickly: 3 planted
+        # arms already give full steering authority.  Tying it to the full 8/8
+        # ratio (rarely reached mid-crawl) was throttling every turn to a crawl.
+        grip_fraction  = planted / self.N_ARMS
+        steer_traction = min(1.0, planted / 3.0)
+        total_torque += self.steer_torque * steer_traction
 
-        # Seabed friction — opposes sliding, reduced by active traction
-        speed = float(np.linalg.norm(self.vel))
-        if speed > 0.5:
-            grip_fraction  = planted / self.N_ARMS
-            friction_mag   = self.SEABED_FRICTION * (1.0 - grip_fraction * 0.55)
-            total_force   -= (self.vel / speed) * friction_mag
+        self.planted_count   = planted
+        self.body_net_force  = total_force.copy()
+        self.body_net_torque = total_torque
 
-        # Integrate body kinematics — fps-independent exponential drag
-        self.vel         += (total_force / self.MASS) * dt
-        self.vel         *= math.exp(-self.DRAG_K * dt)
-
-        self.angular_vel += (total_torque / self.INERTIA) * dt
-        self.angular_vel *= math.exp(-self.ANGULAR_DRAG_K * dt)
-
-        self.angle += self.angular_vel * dt
-
-        old_pos = self.pos.copy()
-        self.pos += self.vel * dt
-        self.total_distance += float(np.linalg.norm(self.pos - old_pos))
-
-        # Soft boundary bounce
-        margin = self.RADIUS + 15
-        for axis, limit in enumerate([width, height]):
-            if self.pos[axis] < margin:
-                self.pos[axis] = margin
-                self.vel[axis] = abs(self.vel[axis]) * 0.4
-            elif self.pos[axis] > limit - margin:
-                self.pos[axis] = limit - margin
-                self.vel[axis] = -abs(self.vel[axis]) * 0.4
+        # Integrate body rigid motion (friction, drag, momentum, bounds).
+        moved = self.body_physics.integrate(
+            self, total_force, total_torque, grip_fraction, dt, width, height
+        )
+        self.total_distance += moved
 
         # Step all arm physics (body_vel passed for drag-along coupling)
         for arm in self.arms:
