@@ -24,14 +24,14 @@ from src.locomotion.body_locomotion import BodyLocomotionController, BodyDrive
 
 class LocomotionManager:
 
-    # PD steering on body heading.  The arms turn the body by tensioning
-    # differentially against their grips; rather than hope that emerges from
-    # per-arm force scaling (it is far too weak to overcome the crawl's own
-    # incidental torque), we close the loop: torque ∝ heading error, damped by
-    # current spin so it eases in and settles without snapping or oscillating.
-    STEER_KP   = 16.0   # torque per radian of heading error (× inertia)
-    STEER_KD   = 7.0    # damping per rad/s of spin        (× inertia)
-    STEER_MAX  = 20000.0 # clamp so a big turn can't fling the body
+    # NOTE: there is deliberately NO body-level steering torque here any more.
+    # Rotation is 100 % emergent: the per-arm TentacleControllers bias their
+    # pull strengths (see TentacleController._turn_factor) so the arms on the
+    # side that helps the wanted turn haul harder, and the body rotates from the
+    # resulting net r×F just like it translates from the net pull.  The old PD
+    # loop that wrote octopus.steer_torque was a controller-driven rotation —
+    # measured at ~1.1× the real tentacle torque — i.e. "the controller turned
+    # the body," not "the tentacles turned it."  It has been removed.
 
     def __init__(self, octopus, width: int, height: int):
         self.octopus = octopus
@@ -71,19 +71,10 @@ class LocomotionManager:
             return
 
         # Central controller turns the raw target into one body-level command;
-        # each arm then chooses its role and force level from that command.
+        # each arm then chooses its role and force level from that command.  The
+        # drive's turn_sign/turn_gain are read by each arm's _turn_factor to bias
+        # its pull — that biasing is the ONLY thing that rotates the body now.
         self.drive = self.body.compute(oct_, self.targets)
-
-        # Closed-loop heading control: ask the body to generate a steering torque
-        # that drives heading_error → 0 (eased by spin damping).  Octopus.update
-        # gates it by how many arms are gripping, so it is still tentacle-borne.
-        inertia = oct_.body_physics.INERTIA
-        if self.drive.has_target:
-            steer = inertia * (self.STEER_KP * self.drive.heading_error
-                               - self.STEER_KD * oct_.angular_vel)
-        else:
-            steer = -inertia * self.STEER_KD * oct_.angular_vel   # settle to rest
-        oct_.steer_torque = float(np.clip(steer, -self.STEER_MAX, self.STEER_MAX))
 
         for ctrl in self.controllers:
             ctrl.decide(oct_, self.drive, dt)

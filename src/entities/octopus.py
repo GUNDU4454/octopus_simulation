@@ -68,12 +68,8 @@ class Octopus:
         self.planted_count   = 0
         self.body_net_force  = np.zeros(2, dtype=np.float64)  # visualisation
         self.body_net_torque = 0.0                            # visualisation
-
-        # Steering torque the locomotion controller asks the arms to generate by
-        # tensioning differentially against their grips (set each frame by the
-        # LocomotionManager; gated by traction below).  Defaults to 0 so the RL
-        # path, which never sets it, is unaffected.
-        self.steer_torque    = 0.0
+        self.pulling_count   = 0                              # visualisation
+        self.pushing_count   = 0                              # visualisation
 
     # ------------------------------------------------------------------
     # Main update — ALL motion comes from tentacle force transfer
@@ -86,36 +82,45 @@ class Octopus:
         for arm in self.arms:
             arm.update_root(self.pos[0], self.pos[1], self.angle, self.RADIUS)
 
-        # Accumulate locomotion forces from anchored arms.
-        # Pulling arms drag the body toward their anchor (tension_force);
-        # pushing arms shove it away from their anchor (push_force).  An arm
-        # in either role counts as "planted" (gripping) for traction.
+        # Accumulate locomotion forces from anchored arms.  EVERY force on the
+        # body comes from an anchored arm acting against its fixed seabed grip:
+        #   tension_force()  PRIMARY — a spring from the body toward the grip,
+        #                    energised by muscle contraction (front arms haul
+        #                    the body to the target).
+        #   push_force()     ASSIST  — a rear arm extends against its grip and
+        #                    shoves the body away from it; the magnitude is
+        #                    emergent from the arm geometry, not a fixed command.
+        # There is no steering torque and no target-follow force any more: if the
+        # arms are not gripping, the body does not move.  Both the net
+        # translation AND the net rotation come straight from the sum of these
+        # anchored forces (torque = r × F about the body centre).
         total_force  = np.zeros(2)
         total_torque = 0.0
         planted = 0
+        pulling = 0
+        pushing = 0
 
         for arm in self.arms:
-            arm_force = arm.tension_force() + arm.push_force()
+            pull = arm.tension_force()
+            push = arm.push_force()
+            arm_force = pull + push
             if arm.is_anchored:
                 planted += 1
+            if float(np.linalg.norm(pull)) > 0.0:
+                pulling += 1
+            if float(np.linalg.norm(push)) > 0.0:
+                pushing += 1
             fmag = float(np.linalg.norm(arm_force))
             if fmag > 0.0:
                 total_force += arm_force
                 r = arm.root_pos() - self.pos
                 total_torque += r[0] * arm_force[1] - r[1] * arm_force[0]
 
-        # Add the controller's steering torque, but only to the extent the arms
-        # have purchase on the seabed — with nothing anchored there is nothing to
-        # torque against, so the body cannot turn in place.  grip_fraction is the
-        # raw planted ratio (used elsewhere for friction); steering needs only a
-        # few solid anchors to have leverage, so it saturates quickly: 3 planted
-        # arms already give full steering authority.  Tying it to the full 8/8
-        # ratio (rarely reached mid-crawl) was throttling every turn to a crawl.
-        grip_fraction  = planted / self.N_ARMS
-        steer_traction = min(1.0, planted / 3.0)
-        total_torque += self.steer_torque * steer_traction
+        grip_fraction = planted / self.N_ARMS
 
         self.planted_count   = planted
+        self.pulling_count   = pulling
+        self.pushing_count   = pushing
         self.body_net_force  = total_force.copy()
         self.body_net_torque = total_torque
 

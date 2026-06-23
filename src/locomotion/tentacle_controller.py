@@ -70,9 +70,9 @@ class TentacleController:
     # compete" guarantee.  Arms whose grips fall outside the cone hold as
     # stabilisers or, if well behind, push.
     REACH_TOWARD_COS = -0.20   # free: mount within ~100° of target → reach for it
-    REACH_AWAY_COS   = -0.60   # free: mount past ~127° away → reach out to push
-    PULL_ANCHOR_COS  =  0.20   # anchored: grip ahead of body → pull toward it
-    PUSH_ANCHOR_COS  = -0.50   # anchored: grip well behind → push body forward
+    REACH_AWAY_COS   = -0.60   # free: mount past ~127° away → reach out to plant a pusher
+    PULL_ANCHOR_COS  =  0.10   # anchored: grip ahead of body → pull toward it (primary)
+    PUSH_ANCHOR_COS  = -0.45   # anchored: grip well behind → push body forward (assist)
 
     # Extension fractions (of full reach) at which a free arm commits a grip.
     # Eased toward PLANT_EXT_NEAR near the target for shorter, finer strokes.
@@ -90,11 +90,11 @@ class TentacleController:
     # into a no-progress limit cycle a hundred-odd px short of the goal
     # (measured).  Cycling stale anchors keeps every arm contributing — and is
     # what makes the arms visibly "reposition continuously" like a real octopus.
-    ANCHOR_HOLD_T   = 0.7
+    ANCHOR_HOLD_T   = 0.9
 
     # Inchworm re-grip: release a pulling arm once the body has hauled itself to
     # within this fraction of full reach of the anchor (the grip is "spent").
-    PULL_CONSUME_FRAC = 0.30
+    PULL_CONSUME_FRAC = 0.25
 
     # Release any anchor the body has drifted away from beyond this fraction of
     # full reach.  A real arm cannot pull from farther than its length; without
@@ -108,9 +108,10 @@ class TentacleController:
 
     # Turn bias: an arm that helps the desired turn scales effort up by up to
     # +TURN_AUTHORITY, one that fights it scales down toward (1 - TURN_AUTHORITY).
-    # Kept small: body heading is steered by the manager's closed-loop torque;
-    # this only adds visible left/right unevenness, it is not the turn's engine.
-    TURN_AUTHORITY = 0.25
+    # This IS the turn's engine now (the injected PD steering torque is gone), so
+    # it is larger than before: the side of arms that helps the wanted turn hauls
+    # noticeably harder, and the body rotates from the resulting net r×F.
+    TURN_AUTHORITY = 0.6
 
     def __init__(self, arm, grip_detect):
         self.arm  = arm
@@ -160,11 +161,15 @@ class TentacleController:
         align = math.cos(delta)
 
         if align >= self.REACH_TOWARD_COS:
-            # Front-ish arm: steer the tip toward the target and plant ahead.
+            # Front-ish arm: steer the tip toward the target and plant ahead so
+            # it becomes a PULLER — the primary locomotion mechanism.  We want as
+            # many arms as possible doing this.
             arm.reach_offset = float(np.clip(delta, -math.pi / 2, math.pi / 2))
             ext = self._plant_ext(self.PLANT_EXT_PULL, drive)
         elif align <= self.REACH_AWAY_COS:
-            # Rear arm: reach straight out (away from target) to plant a pusher.
+            # Rear arm: it physically cannot reach forward past the body, so it
+            # reaches straight out behind to plant a PUSHER that assists the
+            # front pullers by shoving off its rear anchor.
             arm.reach_offset = 0.0
             ext = self._plant_ext(self.PLANT_EXT_PUSH, drive)
         else:
@@ -200,8 +205,12 @@ class TentacleController:
         arm.reach_offset = 0.0
 
         if align >= self.PULL_ANCHOR_COS:
-            # Anchor is toward the target: pulling toward it reduces distance.
-            arm.push_cmd = 0.0
+            # Anchor is toward the target: contract to haul the body toward it.
+            # This is the PRIMARY locomotion mechanism.  Strength scales with how
+            # squarely the grip points at the target (align) and with distance to
+            # go (drive_gain), and is biased left/right by _turn_factor so the
+            # body also rotates from the differential pull.
+            arm.push_cmd     = 0.0
             self._push_timer = 0.0
             self._hold_timer = 0.0
             strength = (0.45 + 0.55 * align) * (0.4 + 0.6 * drive.drive_gain)
@@ -210,7 +219,11 @@ class TentacleController:
             return Role.PULLING
 
         if align <= self.PUSH_ANCHOR_COS:
-            # Anchor is behind: extend against it to shove the body forward.
+            # Anchor is behind: extend the arm against it so it shoves the body
+            # forward.  This ASSISTS the front pullers (rear radial arms can't
+            # reach forward to pull).  push_cmd is muscle EXTENSION activation —
+            # the resulting force is emergent in push_force() from how far the
+            # arm can still extend against its grip, not a fixed constant.
             arm.contract_strength = 0.0
             self._hold_timer = 0.0
             self._push_timer += dt
@@ -223,10 +236,10 @@ class TentacleController:
             return Role.PUSHING
 
         # Side anchor: hold for traction with only light, spin-damping pull so it
-        # never drags the body off course (the old constant pull cancelled the
-        # pullers).  It can also lend a little to a commanded turn.  Held only
-        # briefly (ANCHOR_HOLD_T) before letting go and reaching out fresh, so a
-        # side grip can't permanently sideline the arm and stall the crawl.
+        # never drags the body off course (a constant side pull would cancel the
+        # forward pullers).  It can also lend a little to a commanded turn.  Held
+        # only briefly (ANCHOR_HOLD_T) before letting go and reaching out fresh,
+        # so a side grip can't permanently sideline the arm and stall the crawl.
         arm.push_cmd     = 0.0
         self._push_timer = 0.0
         self._hold_timer += dt

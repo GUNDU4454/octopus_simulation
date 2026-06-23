@@ -33,7 +33,7 @@ class BodyPhysicsController:
                               # crawl's chaotic incidental torque is damped out
                               # and the controller's steering torque dominates,
                               # letting the body settle facing the target
-    SEABED_FRICTION = 14.0    # constant force opposing slide, eased by gripping
+    SEABED_FRICTION = 12.0    # constant force opposing slide, eased by gripping
 
     def integrate(self, body, total_force, total_torque,
                   grip_fraction: float, dt: float,

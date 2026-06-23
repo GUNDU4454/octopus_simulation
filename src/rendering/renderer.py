@@ -31,6 +31,10 @@ ARM_PLANTED   = (220,  80,  60)   # gripping seabed
 ARM_RETRACT   = (160, 160,  60)
 ARM_SLIPPING  = (255, 200,  40)   # amber — grip under stress
 
+# Explicit debug locomotion scheme (the model: search → grab → pull → release).
+SEARCH_RED    = (215,  60,  55)   # arm has NO grip — reaching / recoiling
+GRIP_GREEN    = ( 60, 210,  90)   # arm is anchored to the seabed (gripping/pulling)
+
 # Segment contraction heat tint (blended in based on contraction level)
 CONTRACT_HOT  = (255,  65,  20)   # red-orange for fully contracted muscle
 
@@ -154,12 +158,16 @@ class Renderer:
             if n < 2:
                 continue
 
-            # Base colour: by role when debugging and a role is active (shows
-            # behaviour); otherwise by raw grip state (cleaner look, and the
-            # fallback the RL training view uses since it sets no roles).
-            role = getattr(arm, "role", Role.IDLE)
-            if debug and role != Role.IDLE:
-                base = role_color(role)
+            # Base colour.  In debug we use the explicit locomotion scheme the
+            # whole system is built around: RED  = searching (no grip, just
+            # reaching/recoiling) and GREEN = anchored to the seabed (this arm is
+            # gripping and, if contracting, actively hauling the body).  Slipping
+            # grips show amber so a failing anchor is visible.  Outside debug we
+            # fall back to raw grip-state tints (also what the RL view uses).
+            if debug:
+                if arm.state == GripState.SLIPPING:   base = ARM_SLIPPING
+                elif arm.is_anchored:                 base = GRIP_GREEN
+                else:                                 base = SEARCH_RED
             elif arm.state == GripState.PLANTED:    base = ARM_PLANTED
             elif arm.state == GripState.SLIPPING:   base = ARM_SLIPPING
             elif arm.state == GripState.RETRACTING: base = ARM_RETRACT
@@ -598,19 +606,26 @@ class Renderer:
 
     def _draw_hud(self, octopus, step: int):
         fmag = float(np.linalg.norm(octopus.body_net_force))
+        pulling = getattr(octopus, "pulling_count", 0)
+        pushing = getattr(octopus, "pushing_count", 0)
         lines = [
             f"step    {step:>6}",
             f"speed   {octopus.speed:>6.1f} px/s",
             f"anchored {octopus.planted_count}/8",
             f"dist    {octopus.total_distance:>6.0f} px",
-            f"net_F   {fmag:>6.0f} N",
             f"net_T   {octopus.body_net_torque:>+6.0f}",
         ]
 
+        # Body-force source: this is the whole point of the sim — make it
+        # unmistakable that the body moves ONLY because anchored arms act on it,
+        # with pulling as the primary driver and pushing as the rear assist.
+        source     = f"DRIVEN BY: {pulling} pulling + {pushing} pushing"
+        force_line = f"  = {fmag:>5.0f} N anchored-tentacle force"
+
         pad = 10
         lh  = 18
-        w   = 168
-        h   = len(lines) * lh + pad * 2
+        w   = 250
+        h   = (len(lines) + 2) * lh + pad * 2
 
         hud = pygame.Surface((w, h), pygame.SRCALPHA)
         hud.fill((8, 14, 10, 190))
@@ -619,6 +634,12 @@ class Renderer:
         for i, line in enumerate(lines):
             surf = self.font_sm.render(line, True, HUD_TEXT)
             self.screen.blit(surf, (pad*2, pad*2 + i*lh))
+
+        src_col = FORCE_BODY if (pulling + pushing) > 0 else HUD_DIM
+        ssurf = self.font_md.render(source, True, src_col)
+        self.screen.blit(ssurf, (pad*2, pad*2 + len(lines)*lh + 2))
+        fsurf = self.font_sm.render(force_line, True, src_col)
+        self.screen.blit(fsurf, (pad*2, pad*2 + (len(lines)+1)*lh + 2))
 
         # Per-arm strip at bottom
         strip_y = self.height - 46
@@ -658,18 +679,17 @@ class Renderer:
             if bar_w > 0:
                 pygame.draw.rect(self.screen, TENSION_BAR, (x, bar_y, bar_w, 6))
 
-        # Role legend
-        legend = self.font_xs.render(
-            "pull  push  anchor  stabilize  search   [ contraction ]  [ tension ]",
-            True, (70, 80, 60)
-        )
-        self.screen.blit(legend, (12, self.height - 22))
+        # Grip legend: red = searching (no grip), green = anchored/pulling.
+        red_lbl   = self.font_xs.render("red = searching", True, SEARCH_RED)
+        green_lbl = self.font_xs.render("green = gripping/pulling", True, GRIP_GREEN)
+        self.screen.blit(red_lbl,   (12, self.height - 22))
+        self.screen.blit(green_lbl, (120, self.height - 22))
 
         # Force legend
-        fleg_col  = self.font_xs.render("── net force", True, FORCE_BODY)
+        fleg_col  = self.font_xs.render("── body net force", True, FORCE_BODY)
         vleg_col  = self.font_xs.render("── velocity", True, VELOCITY_VEC)
-        tleg_col  = self.font_xs.render("── arm pull", True, FORCE_ARM)
-        pleg_col  = self.font_xs.render("── arm push", True, PUSH_ARM)
+        tleg_col  = self.font_xs.render("── arm pull (primary)", True, FORCE_ARM)
+        pleg_col  = self.font_xs.render("── arm push (assist)", True, PUSH_ARM)
         self.screen.blit(fleg_col,  (self.width - 250, self.height - 72))
         self.screen.blit(vleg_col,  (self.width - 250, self.height - 58))
         self.screen.blit(tleg_col,  (self.width - 250, self.height - 44))

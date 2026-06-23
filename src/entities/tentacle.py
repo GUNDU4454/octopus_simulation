@@ -50,19 +50,24 @@ class Tentacle:
     SEG_LEN     = 26.0
     SEG_MASS    = 0.25
 
-    # Muscle contraction
+    # Muscle contraction (pull) and extension (push)
     MAX_CONTRACTION  = 0.45    # arm can shorten to 55 % of rest length
+    MAX_EXTENSION    = 0.30    # arm can lengthen to 130 % of rest length (push)
     CONTRACT_RATE    = 6.0     # activation ramp (1/s)
     RELAX_RATE       = 2.5     # deactivation ramp (1/s)
 
     # Force coefficients
-    MUSCLE_STIFFNESS  = 180.0  # active pull per unit stretch × contraction
+    MUSCLE_STIFFNESS  = 230.0  # active pull per unit stretch × contraction
     PASSIVE_STIFFNESS = 2.2    # passive spring beyond natural rest
 
-    # Push (extension against anchor) — a planted arm shoving the body away.
-    # Mirror of tension_force: the substrate reacts on the arm, driving the
-    # body in the anchor→root direction.  Scaled by push_cmd from the controller.
-    PUSH_STIFFNESS    = 230.0  # body-reaction force per unit push_cmd
+    # Push (extension against anchor) — a planted rear arm shoving the body away.
+    # NOT a fixed command×constant any more: push_force() models the arm as a
+    # muscle that, when activated, wants to reach an EXTENDED target length and
+    # springs the body away from the grip by however far it can still extend.
+    # The force is therefore emergent from the arm geometry (root-to-anchor
+    # distance vs the extended target) and self-limits as the stroke completes —
+    # exactly mirroring how tension_force emerges from contraction geometry.
+    PUSH_MUSCLE_STIFFNESS = 150.0  # active push per unit (extended_target - dist)
 
     # Verlet physics
     DRAG             = 0.91    # per-point Verlet damping (slightly reduced for inertia)
@@ -90,7 +95,8 @@ class Tentacle:
         self.points[0].fixed = True   # root teleported to body perimeter each frame
 
         self.radii = [max(1.5, 7.5 - i * 0.72) for i in range(self.n + 1)]
-        self.contractions = np.zeros(self.n, dtype=np.float64)
+        self.contractions   = np.zeros(self.n, dtype=np.float64)
+        self.push_activation = 0.0   # [0,1] extension activation (ramped push_cmd)
 
         # RL control inputs — written by Octopus.apply_action each frame
         self.grip_cmd          = 0.0   # [0,1]
@@ -210,9 +216,15 @@ class Tentacle:
                           else self.RELAX_RATE)
                 self.contractions[i] += (target - self.contractions[i]) * dt * rate
                 self.contractions[i]  = float(np.clip(self.contractions[i], 0.0, 1.0))
+            # Extension activation ramps toward push_cmd (mutually exclusive with
+            # contraction: the controller never raises both on the same arm).
+            erate = self.CONTRACT_RATE if self.push_cmd > self.push_activation else self.RELAX_RATE
+            self.push_activation += (self.push_cmd - self.push_activation) * dt * erate
         else:
             decay = max(0.0, 1.0 - dt * self.RELAX_RATE)
-            self.contractions *= decay
+            self.contractions   *= decay
+            self.push_activation *= decay
+        self.push_activation = float(np.clip(self.push_activation, 0.0, 1.0))
 
     # ------------------------------------------------------------------
     # Forces
@@ -276,12 +288,16 @@ class Tentacle:
         # pulling the tip toward the root.  The anchor then resists this.
         for _ in range(self.SOLVER_ITERS):
             for i in range(self.n):
-                contracted_len = self.SEG_LEN * (
-                    1.0 - self.contractions[i] * self.MAX_CONTRACTION
+                # Active rest length: contraction shortens it (pull), extension
+                # activation lengthens it (push).  A given arm only does one.
+                seg_len = self.SEG_LEN * (
+                    1.0
+                    - self.contractions[i] * self.MAX_CONTRACTION
+                    + self.push_activation * self.MAX_EXTENSION
                 )
                 constrain_distance(
                     self.points[i], self.points[i + 1],
-                    contracted_len, stiffness=self.CONSTRAINT_STIFF
+                    seg_len, stiffness=self.CONSTRAINT_STIFF
                 )
 
         if not anchored:
@@ -341,6 +357,12 @@ class Tentacle:
             self._last_tension_mag = 0.0
             return np.zeros(2)
 
+        # A pushing arm (extension activated, no contraction) produces no pull —
+        # otherwise its passive stretch spring would fight its own push.
+        if self.push_activation > 0.05 and float(np.mean(self.contractions)) < 0.05:
+            self._last_tension_mag = 0.0
+            return np.zeros(2)
+
         root   = self.points[0].pos
         anchor = self.grip_point
         vec    = anchor - root
@@ -369,23 +391,26 @@ class Tentacle:
 
     def push_force(self) -> np.ndarray:
         """
-        Reaction force a planted arm exerts on the body when it shoves itself
-        away from its anchor (push_cmd > 0).
+        Reaction force a planted rear arm exerts on the body by extending against
+        its anchor.  EMERGENT, not a fixed command:
 
-        Physical picture: the tip is gripped on the seabed and the arm extends,
-        pressing against the substrate.  By Newton's third law the substrate
-        pushes back along anchor→root, driving the body away from the grip
-        point.  This is the mirror of tension_force(): pulling arms drag the
-        body toward their anchor, pushing arms drive it away.
+          The activated arm wants to reach an extended target length
+              extended_target = natural * (1 + push_activation * MAX_EXTENSION)
+          With the tip gripped on the seabed, the only way to lengthen is to
+          drive the root (body) away from the grip.  The force is the extension
+          spring's remaining effort = how far it can still extend
+          (extended_target - dist), so it is strong at the start of the stroke
+          and fades to zero as the arm reaches full extension — a genuine,
+          self-limiting push stroke that depends on the arm geometry, exactly
+          like tension_force depends on contraction geometry.
 
-        Returns the body-side push vector (zero unless anchored and commanded).
-        A pushing arm runs with low contraction, so its tension_force() is
-        near zero — the two never fight for the same arm.
+        Direction is anchor→root, so the body is driven away from the grip.
+        Returns zero unless the arm is anchored and its extension is activated.
         """
         if self.state not in (GripState.PLANTED, GripState.SLIPPING):
             self._last_push_mag = 0.0
             return np.zeros(2)
-        if self.push_cmd < 0.05:
+        if self.push_activation < 0.05:
             self._last_push_mag = 0.0
             return np.zeros(2)
 
@@ -399,12 +424,17 @@ class Tentacle:
 
         direction = vec / dist
 
+        natural         = self.n * self.SEG_LEN * 0.9
+        extended_target = natural * (1.0 + self.push_activation * self.MAX_EXTENSION)
+        overshoot       = max(0.0, extended_target - dist)   # room left to extend
+        active          = overshoot * self.PUSH_MUSCLE_STIFFNESS * self.push_activation
+
         # Slipping grip transmits less push, same as pull traction.
         slip_factor = 1.0
         if self.state == GripState.SLIPPING:
             slip_factor = max(0.05, 1.0 - self.slip_amount / self.MAX_SLIP_DIST)
 
-        mag = self.push_cmd * self.PUSH_STIFFNESS * slip_factor
+        mag = active * slip_factor
         self._last_push_mag = mag
         return direction * mag
 
