@@ -58,6 +58,7 @@ def main():
     clock    = pygame.time.Clock()
     renderer = Renderer(screen, WIDTH, HEIGHT)
 
+    
     octopus = Octopus(WIDTH / 2, HEIGHT / 2)
     manager = LocomotionManager(octopus, WIDTH, HEIGHT)
 
